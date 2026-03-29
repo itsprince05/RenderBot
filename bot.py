@@ -1145,7 +1145,8 @@ import traceback
 
 import secrets
 import string
-from web_server import start_web_server, send_dashboard_credentials, RENDER_EXTERNAL_URL
+from web_server import start_web_server, start_cloudflared_tunnel, TUNNEL_URL
+import web_server # to access updated TUNNEL_URL
 
 web_app = None
 
@@ -1157,7 +1158,7 @@ async def url_command_handler(event):
         await event.respond("Web dashboard is not initialized yet.")
         return
         
-    # Generate new password (invalidates the old one)
+    # Generate new password
     chars = string.ascii_letters + string.digits
     new_password = ''.join(secrets.choice(chars) for _ in range(10))
     
@@ -1166,24 +1167,27 @@ async def url_command_handler(event):
     
     status_msg = await event.respond("Generating new dashboard access...")
     
-    # Send the fixed Render URL + new credentials
+    # Restart Tunnel (This will send the new URL and password to the group once ready)
+    port = 8081
     master_password = web_app['master_password']
-    await send_dashboard_credentials(bot, Admins_Group_ID, new_password, master_password, status_msg)
+    await start_cloudflared_tunnel(port, bot, Admins_Group_ID, new_password, master_password, status_msg)
 
 print("Bot is running...")
 bot.loop.create_task(restore_sessions())
 bot.loop.create_task(check_restart_msg())
 
-# Start Web Server and send dashboard credentials
+# Start Web Server and Cloudflare Tunnel tasks
 async def start_dashboard():
     global web_app
     try:
-        # Start web server on PORT env var (required by Render)
-        site, password, master_password, app = await start_web_server(active_sessions)
+        # Start web server on port 8081 (or configurable)
+        port = 8081
+        # Unpack 4 values including app
+        site, password, master_password, app = await start_web_server(active_sessions, port)
         web_app = app
         
-        # Send the fixed Render URL + credentials to admin group
-        await send_dashboard_credentials(bot, Admins_Group_ID, password, master_password)
+        # Start Tunnel (Uses the INITIAL password in the log, but subsequent /url calls will show NEW password)
+        await start_cloudflared_tunnel(port, bot, Admins_Group_ID, password, master_password)
     except Exception as e:
         import traceback
         logger.error(f"Dashboard failed to start: {e}\\n{traceback.format_exc()}")
