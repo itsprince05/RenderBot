@@ -6,7 +6,8 @@ import secrets
 import string
 import os
 import json
-
+import platform
+import stat
 from datetime import datetime, timedelta
 from config import USERS_DIR, DOWNLOAD_FILTER_ADMINS
 from telethon.tl.functions.users import GetFullUserRequest, GetUsersRequest
@@ -789,7 +790,8 @@ async def handle_index(request):
     """
     return web.Response(text=html_content, content_type='text/html')
 
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
+TUNNEL_URL = None
+TUNNEL_PROCESS = None
 
 async def handle_user_profile(request):
     try:
@@ -3425,8 +3427,7 @@ async def handle_story_media_api(request):
         return web.Response(status=500, text=str(e))
 
 
-async def start_web_server(active_sessions):
-    port = int(os.getenv("PORT", "8081"))
+async def start_web_server(active_sessions, port):
     chars = string.ascii_letters + string.digits
     password = ''.join(secrets.choice(chars) for _ in range(10))
     master_password = ''.join(secrets.choice(chars) for _ in range(15))
@@ -3480,6 +3481,7 @@ async def start_web_server(active_sessions):
     chat_viewer.register_chat_routes(app)
     runner = web.AppRunner(app)
     await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', port)
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logger.info(f"Web server started on http://0.0.0.0:{port}")
@@ -3497,14 +3499,147 @@ async def handle_check_master(request):
     except:
         return web.json_response({'success': False})
 
-async def send_dashboard_credentials(bot, chat_id, password, master_password, status_msg=None):
-    """Sends the fixed Render URL and credentials to the admin Telegram group."""
-    url = RENDER_EXTERNAL_URL
-    msg_text = f"Web Dashboard Access...\n\nLogin Password\n<code>{password}</code>\n\nMaster Password\n<code>{master_password}</code>\n\n{url}"
-    try:
-        if status_msg:
-            await status_msg.edit(msg_text, parse_mode='html')
+async def start_cloudflared_tunnel(port, bot, update_group_id, password, master_password, status_msg=None):
+    global TUNNEL_PROCESS
+    
+    # Kill existing tunnel if any
+    if TUNNEL_PROCESS:
+        try:
+            logger.info("Stopping existing Cloudflared process...")
+            TUNNEL_PROCESS.terminate()
+            # Wait briefly?
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Failed to stop cloudflared: {e}")
+
+    # Determine OS and Arch
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    
+    cwd = os.getcwd()
+    filename = 'cloudflared.exe' if system == 'windows' else 'cloudflared'
+    local_binary = os.path.join(cwd, filename)
+    
+    cmd = None
+    
+    # 1. Check if local binary exists
+    if os.path.exists(local_binary):
+        cmd = local_binary
+        # Ensure execution permission on Linux/Mac
+        if system != 'windows':
+            try:
+                st = os.stat(local_binary)
+                os.chmod(local_binary, st.st_mode | stat.S_IEXEC)
+            except Exception as e:
+                logger.error(f"Failed to chmod binary: {e}")
+    else:
+        # 2. Try global command
+        import shutil
+        if shutil.which('cloudflared'):
+            cmd = 'cloudflared'
         else:
-            await bot.send_message(chat_id, msg_text, parse_mode='html')
+            # 3. Auto-Download Logic
+            logger.info(f"Cloudflared binary not found. Attempting download for {system}/{machine}...")
+            base_url = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+            
+            # Map platform to URL
+            download_url = None
+            if system == 'windows':
+                download_url = base_url + "cloudflared-windows-amd64.exe"
+            elif system == 'linux':
+                if 'aarch64' in machine or 'arm64' in machine:
+                    download_url = base_url + "cloudflared-linux-arm64"
+                elif 'arm' in machine: # 32-bit arm
+                    download_url = base_url + "cloudflared-linux-arm"
+                else: # amd64/x86_64
+                    download_url = base_url + "cloudflared-linux-amd64"
+            elif system == 'darwin':
+                download_url = base_url + "cloudflared-darwin-amd64" # assume intel/rosetta for simplicity or check M1
+            
+            if download_url:
+                try:
+                    await bot.send_message(update_group_id, f"Downloading Cloudflared for {system}...", parse_mode='html')
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(download_url) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                with open(local_binary, 'wb') as f:
+                                    f.write(data)
+                                cmd = local_binary
+                                logger.info("Download successful.")
+                                # chmod
+                                if system != 'windows':
+                                    st = os.stat(local_binary)
+                                    os.chmod(local_binary, st.st_mode | stat.S_IEXEC)
+                            else:
+                                logger.error(f"Download returned {resp.status}")
+                except Exception as e:
+                    logger.error(f"Download failed: {e}")
+            else:
+                logger.error("Unsupported platform for auto-download.")
+
+    if not cmd:
+        await bot.send_message(update_group_id, "Could not find or download Cloudflared binary. Please install manually.")
+        return
+
+    logger.info(f"Starting Cloudflared with command: {cmd}")
+            
+    try:
+        process = await asyncio.create_subprocess_exec(
+            cmd, 'tunnel', '--url', f'http://127.0.0.1:{port}',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        TUNNEL_PROCESS = process
+        logger.info("Cloudflared process started")
+        
+        # Create a shared state for url sent to avoid duplicate sends
+        state = {'url_sent': False, 'failure_notified': False}
+        
+        async def check_stream(stream, stream_name):
+            global TUNNEL_URL
+            while True:
+                line = await stream.readline()
+                if not line: break
+                decoded_line = line.decode('utf-8', errors='ignore').strip()
+                if not decoded_line: continue
+                logger.info(f"CLOUDFLARED: {decoded_line}")
+                
+                if not state['url_sent'] and '.trycloudflare.com' in decoded_line:
+                    match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', decoded_line)
+                    if match:
+                        url = match.group(0)
+                        TUNNEL_URL = url
+                        logger.info(f"Found Tunnel URL: {url}")
+                        try:
+                            msg_text = f"Web Dashboard Access...\n\nLogin Password\n<code>{password}</code>\n\nMaster Password\n<code>{master_password}</code>\n\n{url}"
+                            if status_msg:
+                                await status_msg.edit(msg_text, parse_mode='html')
+                            else:
+                                await bot.send_message(update_group_id, msg_text, parse_mode='html')
+                            state['url_sent'] = True
+                        except Exception as e:
+                            logger.error(f"Failed to send URL: {e}")
+            
+            # Stream ended - check if process exited without URL
+            if not state['url_sent'] and process.returncode is not None:
+                if not state['failure_notified']:
+                     state['failure_notified'] = True
+                     # Give a moment for the other stream or buffers
+                     await asyncio.sleep(1)
+                     try: 
+                         stderr_out = await process.stderr.read()
+                         err_msg = stderr_out.decode('utf-8', errors='ignore')[-200:] if stderr_out else "Unknown error"
+                         await bot.send_message(update_group_id, f"Cloudflared process exited without URL.\nExit Code: {process.returncode}")
+                     except: pass
+
+        asyncio.create_task(check_stream(process.stderr, "STDERR"))
+        asyncio.create_task(check_stream(process.stdout, "STDOUT"))
+        return process
     except Exception as e:
-        logger.error(f"Failed to send dashboard credentials: {e}")
+        logger.error(f"Error starting cloudflared: {e}")
+        # Notify user of failure to start
+        try:
+             await bot.send_message(update_group_id, f"Failed to start Cloudflare Tunnel.\nError: {e}")
+        except: pass
