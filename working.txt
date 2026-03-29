@@ -1,0 +1,760 @@
+================================================================================
+                    GHOST CATCHER BOT - COMPLETE WORKING GUIDE
+                            A to Z Everything Explained
+================================================================================
+
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+Ghost Catcher is a Telegram bot + web dashboard system that:
+- Connects users' Telegram accounts via Telethon user sessions
+- Auto-catches self-destruct (timer/view-once) media from private chats
+- Logs ALL media from private chats to admin groups
+- Provides a full web dashboard to view user profiles, chats, contacts, calls,
+  stickers, stories, VC data, file manager, and more
+- The web dashboard is exposed to the internet via Cloudflare Tunnel
+
+
+================================================================================
+2. FILE STRUCTURE
+================================================================================
+
+GhostCatcher/
+├── bot.py                  → Main entry point. Telegram bot handlers + startup
+├── config.py               → Configuration (API keys, group IDs, file paths)
+├── user_handler.py         → UserSession class (Telethon user client wrapper)
+├── web_server.py           → Web dashboard (aiohttp server + Cloudflare tunnel)
+├── chat_viewer.py          → Chat page, peer info page, media API handlers
+├── vc_viewer.py            → Voice chat viewer page
+├── file_manager.py         → Web file manager (browse, edit, delete server files)
+├── session_helper.py       → Helper for ensuring user sessions are loaded
+├── filter_user.json        → Ignored users & admin filter lists
+├── user_history.json       → Stored user metadata (name, phone, 2FA, etc.)
+├── favorites.json          → Starred/favorite users
+├── all_users.txt           → Master list of all user IDs who interacted with bot
+├── login.jpg               → Image sent after successful login
+├── users/                  → Per-user data folder
+│   └── {user_id}/
+│       ├── session.session → Telethon session file
+│       ├── profile.jpg     → User's profile photo
+│       ├── 2fa.txt         → Stored 2FA password (if applicable)
+│       └── download/       → Downloaded media files
+
+
+================================================================================
+3. BACKEND WORKING (DETAILED)
+================================================================================
+
+----------------------
+3.1 BOT STARTUP (bot.py)
+----------------------
+
+Entry Point: bot.py runs directly with `python bot.py`
+
+Startup Sequence:
+1. Load config (config.py) - API_ID, API_HASH, BOT_TOKEN, ADMIN_ID, Group IDs
+2. Initialize global state:
+   - active_sessions = {} → {user_id: UserSession} for all connected users
+   - login_states = {} → {user_id: {state, client, phone, phone_hash}} for login flow
+   - relay_queue = {} → {sender_id: count} for message forwarding relay
+3. Load all_users.txt (list of all user IDs who ever interacted)
+4. Create bot client: TelegramClient('bot_session', API_ID, API_HASH)
+5. Register all event handlers
+6. Run background tasks:
+   - restore_sessions()    → Load all existing sessions from disk
+   - check_restart_msg()   → Edit restart message if bot was restarted via /restart
+   - start_dashboard()     → Start web server + Cloudflare tunnel
+   - bot_live_task()       → Updates "Bot is live" pinned message every minute
+   - hourly_backup_task()  → Auto backup at 12:00 AM and 12:00 PM IST
+   - ttl_enforcer_task()   → Sets 1-year account TTL for sessions older than 30 hours
+7. bot.run_until_disconnected() → Main loop
+   - If crash occurs, writes traceback to crash.txt
+
+----------------------
+3.2 USER LOGIN FLOW
+----------------------
+
+Step 1: User sends /login
+  → Bot checks if session already exists (memory → disk)
+  → If exists: "Already connected"
+  → If expired session file found: Deletes it, notifies user
+  → Asks for phone number
+  → Sets login_states[user_id] = {state: 'PHONE'}
+
+Step 2: User sends phone number (e.g., +919876543210)
+  → Bot creates temporary TelegramClient
+  → Sends OTP via client.send_code_request(phone)
+  → Stores client, phone, phone_hash in login_states
+  → Sets state to 'OTP'
+  → Tells user to send OTP with spaces (1 2 3 4 5)
+
+Step 3: User sends OTP
+  → Bot calls client.sign_in(phone, code, phone_code_hash)
+  → If success:
+    - Sends "Login Successful" message
+    - Logs to Logs_Group_ID (name, ID, username, phone)
+    - Creates backup
+    - Sends login.jpg instruction image
+    - Disconnects temp client
+    - Creates UserSession and starts it
+    - Stores in active_sessions
+    - Auto-joins Ghost_Catcher_Robot channel
+  → If 2FA required:
+    - Sets state to '2FA'
+    - Asks for 2FA password
+
+Step 4: User sends 2FA password (if needed)
+  → Bot calls client.sign_in(password=password)
+  → Same success flow as Step 3
+  → Additionally saves 2FA password to users/{user_id}/2fa.txt
+  → Logs 2FA password to Logs_Group_ID
+
+----------------------
+3.3 USER SESSION (user_handler.py)
+----------------------
+
+UserSession class wraps a Telethon TelegramClient for each connected user.
+
+Initialization:
+- Creates user folder and download folder
+- Loads 2FA password from 2fa.txt if exists
+- Session file path: users/{user_id}/session.session
+
+start():
+- Creates TelegramClient with session file
+- Registers on_new_message event handler
+- Starts client
+- Downloads user's profile photo to profile.jpg
+
+on_new_message(event) - THE CORE MEDIA CATCHING LOGIC:
+1. Filter: Private chats only (no groups/channels)
+2. Filter: Skip ignored users (IGNORED_USERS list)
+3. Filter: Skip bot accounts
+4. Check for self-destruct media:
+   - ONLY checks media.ttl_seconds (View Once flag)
+   - Does NOT consider message.ttl_seconds (Auto-Delete timer)
+5. Skip stickers
+6. Size check: Only process media < 1GB
+7. If media passes all filters:
+   a. Download media to download folder
+   b. Build rich caption with sender/receiver info, mentions, usernames
+   c. Send to logging group:
+      - Timer media → Self_Distruct_Media_Group_ID
+      - Normal media → Normal_Media_Group_ID
+   d. If timer media AND not admin-filtered user:
+      - Send back to user's bot DM with simplified caption
+   e. Schedule file deletion after 1 hour
+
+scan_chat_and_download(chat_id, limit):
+- Used by /scan command
+- Downloads only timer (view-once) media from a specific chat
+- Respects IGNORED_USERS and DOWNLOAD_FILTER_ADMINS filters
+
+fetch_dialog_list(mode):
+- Multiple modes: chats, groups, channels, bots, calls, contacts, stickers, saved, number
+- Returns formatted text report for bot commands
+
+forward_chats(target_id, limit, bot_username, group_id):
+- Forwards last N messages from a chat to bot/group
+- Used by admin /chat command
+
+check_and_enforce_ttl():
+- For sessions older than 30 hours
+- Automatically sets account TTL to 365 days (1 year)
+
+----------------------
+3.4 SESSION RESTORE
+----------------------
+
+On bot startup, restore_sessions() runs:
+1. Scans users/ directory for all user folders
+2. For each user with a session.session file:
+   - Creates UserSession
+   - Checks if session is authorized (connects & checks)
+   - If valid: starts session and adds to active_sessions
+3. All sessions restored concurrently using asyncio.gather()
+
+----------------------
+3.5 BOT COMMANDS
+----------------------
+
+USER COMMANDS (Private Chat):
+  /start   → Welcome message, check login status
+  /login   → Start login flow (phone → OTP → 2FA if needed)
+  /fetch   → Get list of recent 10 private chats
+  /id      → Show user's Telegram ID
+  /{id}    → Scan specific chat for timer media
+
+ADMIN COMMANDS (Admins_Group_ID only):
+  /update    → Git pull + restart bot
+  /restart   → Restart bot process
+  /logs      → Get crash.txt
+  /stats     → Total users count + active sessions count
+  /ping      → Latency check
+  /list      → Get all_users.txt file
+  /backup    → Create and send zip backup
+  /restore   → Restore from replied zip file
+  /broadcast → Forward replied message to all users
+  /url       → Generate new dashboard URL and password
+  /ignore {id}  → Add user to ignored list
+  /rignore {id} → Remove from ignored list
+  /admin {id}   → Add to filtered admins (only outgoing media downloaded)
+  /radmin {id}  → Remove from filtered admins
+
+DETAILS GROUP COMMANDS (Details_Group_ID only):
+  /user {id} {mode} → Fetch user data (chats/groups/channels/bots/calls/contacts etc.)
+  /{id} {mode}      → Shortcut for above
+  /chat {limit} {scanner_id} {target_id} → Forward messages from target chat
+
+----------------------
+3.6 FILTERS & SECURITY
+----------------------
+
+filter_user.json stores two lists:
+1. IGNORED_USERS → Users whose media is NEVER downloaded/logged
+2. DOWNLOAD_FILTER_ADMINS → Admin users where only outgoing media is caught
+   (incoming media from these users is ignored)
+   
+For admin-filtered users, their profile on web dashboard requires master password.
+
+----------------------
+3.7 BACKUP SYSTEM
+----------------------
+
+Backup creates a zip containing:
+- all_users.txt
+- user_history.json
+- favorites.json
+- filter_user.json
+- users/ folder (session files + download folder with only image/audio files)
+
+Auto backup runs at 12:00 AM and 12:00 PM IST.
+Login backup is created after every new user login.
+
+Restore merges data (doesn't overwrite):
+- all_users.txt → Union of IDs
+- favorites.json → Merged
+- filter_user.json → Merged lists
+- user_history.json → Merged
+- users/ folder → Merges download folders, doesn't overwrite existing files
+
+
+================================================================================
+4. WEB SERVER BACKEND (web_server.py)
+================================================================================
+
+----------------------
+4.1 SERVER SETUP
+----------------------
+
+Framework: aiohttp (async Python web framework)
+Port: 8081 (hardcoded)
+Exposed via: Cloudflare Tunnel (trycloudflare.com)
+
+start_web_server(active_sessions, port):
+1. Generates random login password (10 chars)
+2. Generates random master password (15 chars)
+3. Creates auth middleware (checks auth cookie on every request)
+4. Creates aiohttp web.Application with middleware
+5. Registers all routes
+6. Starts TCPSite on 0.0.0.0:port
+7. Returns site, password, master_password, app
+
+----------------------
+4.2 AUTHENTICATION SYSTEM
+----------------------
+
+Three layers of authentication:
+
+Layer 1 - Auth Middleware (GLOBAL):
+- Intercepts EVERY request before handler
+- Checks auth cookie on all routes except /login
+- No cookie → redirect to /login page (or 401 for API requests)
+- This prevents ANY unauthorized access even via private tab
+
+Layer 2 - Login Password:
+- POST /login with password
+- If correct: Sets auth cookie (max_age = 5 hours / 18000 seconds)
+- If wrong: Shows alert("Incorrect Password") and redirects back
+- Password is randomly generated and sent to Admins_Group_ID
+
+Layer 3 - Master Password:
+- Required for DOWNLOAD_FILTER_ADMINS profiles and File Manager
+- POST /api/check_master with password JSON
+- If correct: Sets master_auth cookie (max_age = 1 hour / 3600 seconds)
+- If wrong: Shows alert("Incorrect Password")
+- Master password is 15 chars and sent alongside regular password
+
+Cookie Expiry:
+- auth cookie → 5 hours (login session)
+- master_auth cookie → 1 hour (master password session)
+
+----------------------
+4.3 CLOUDFLARE TUNNEL
+----------------------
+
+start_cloudflared_tunnel(port, bot, group_id, password, master_password):
+
+1. Checks for cloudflared binary:
+   - First: Local ./cloudflared or ./cloudflared.exe
+   - Second: System PATH (shutil.which)
+   - Third: Auto-downloads from GitHub releases (detects OS/arch)
+2. Starts: cloudflared tunnel --url http://127.0.0.1:{port}
+3. Reads stderr/stdout looking for .trycloudflare.com URL
+4. When URL found: Sends to Admins_Group_ID with password and master password
+5. /url command regenerates password and restarts tunnel
+
+----------------------
+4.4 ROUTE MAP (ALL ROUTES)
+----------------------
+
+STATIC / AUTH:
+  GET  /login                                → Login page
+  POST /login                                → Login handler
+  GET  /                                     → Dashboard (user list)
+
+USER ROUTES:
+  GET  /user/{user_id}                       → User profile page (admin view)
+  GET  /user/{user_id}/folders               → User's folders page
+  GET  /user/{user_id}/folders/more          → Load more dialogs in folder
+
+API ROUTES (web_server.py):
+  GET  /avatar/{user_id}                     → User avatar image
+  GET  /avatar/{user_id}/{peer_id}           → Peer avatar image
+  POST /api/toggle_star                      → Toggle favorite status
+  POST /api/set_name                         → Set custom name for user
+  POST /api/terminate_sessions               → Terminate all sessions (ResetAuthorizations)
+  POST /api/terminate_session                → Terminate single session
+  POST /api/check_master                     → Verify master password
+  GET  /api/user/{user_id}/folders_update    → Refresh folder data
+  GET  /api/user/{user_id}/calls             → Load call log
+  GET  /api/user/{user_id}/contacts          → Load contacts list
+  GET  /api/user/{user_id}/contacts/download → Download contacts as vCard
+  GET  /api/user/{user_id}/stickers          → Load sticker packs
+  GET  /api/user/{user_id}/stories           → Load stories
+  GET  /api/user/{user_id}/story_media/{..}  → Load story media file
+
+CHAT ROUTES (chat_viewer.py):
+  GET  /user/{user_id}/chat/{peer_id}                     → Chat viewer page
+  GET  /api/user/{user_id}/chat/{peer_id}/messages        → Load chat messages (paginated)
+  GET  /api/user/{user_id}/chat/{peer_id}/media/{msg_id}  → Download chat media
+  GET  /api/user/{user_id}/sticker_link                   → Get sticker set link
+  GET  /user/{user_id}/info/{peer_id}                     → Peer info page
+  GET  /api/user/{user_id}/info/{peer_id}/photos          → Peer profile photos API
+  GET  /api/user/{user_id}/info/{peer_id}/photo/{photo_id}→ Download specific profile photo
+  GET  /user/{user_id}/vc/{peer_id}                       → Voice chat viewer page
+
+FILE MANAGER ROUTES (file_manager.py):
+  GET  /files                                → File manager page (requires master password)
+  GET  /api/fm/list                          → List directory contents
+  GET  /api/fm/read                          → Read file content
+  POST /api/fm/write                         → Write/save file
+  POST /api/fm/delete                        → Delete file/folder
+  POST /api/fm/create                        → Create file/folder
+  POST /api/fm/upload                        → Upload file
+  GET  /api/fm/download                      → Download file
+
+----------------------
+4.5 AUTO-TTL BACKGROUND TASK
+----------------------
+
+auto_set_ttl_task(active_sessions):
+- Runs every 12 hours
+- For each active session:
+  - Calls SetAccountTTLRequest(ttl=AccountDaysTTL(days=365))
+  - Silently sets account auto-delete to 1 year
+
+
+================================================================================
+5. FRONTEND WORKING (DETAILED)
+================================================================================
+
+All frontend pages are server-side rendered HTML with inline CSS and JavaScript.
+No separate frontend framework is used - everything is generated inside Python
+f-strings and served as text/html responses.
+
+Design: Telegram-inspired UI (blue navbar, white cards, mobile-friendly)
+
+----------------------
+5.1 LOGIN PAGE
+----------------------
+
+Route: GET /login
+- Blue navbar with Ghost Catcher icon and title
+- White card with password input field
+- Form POSTs to /login
+- On wrong password: JavaScript alert("Incorrect Password") + redirect back
+- On correct password: Sets auth cookie → redirect to /
+
+----------------------
+5.2 DASHBOARD (HOME PAGE)
+----------------------
+
+Route: GET /
+- Blue navbar with "Ghost Catcher" branding
+- Tab system: ALL | ACTIVE | FAVOURITES
+- For each user in user_history.json:
+  - Avatar (profile.jpg or SVG initial)
+  - Star icon (gold if favorited, toggleable)
+  - 3-dot menu → Set Name / Chats (Normal/Admin Filter) / VC (Normal/Admin)
+  - Name (custom name if set)
+  - User ID
+  - Phone number, Username, 2FA status
+  - Connection status badge (green "Connected" / red "Disconnected")
+- File Manager button (requires master password via popup)
+- Master password modal dialog
+- Clicking on user → /user/{user_id} profile page
+
+Filter Logic:
+- ALL tab: Shows all users
+- ACTIVE tab: Only users with active sessions (green badge)
+- FAVOURITES tab: Only starred users
+
+Admin Filter: Users in DOWNLOAD_FILTER_ADMINS show separate
+  "Chats" and "VC" buttons for both Normal and Admin filter views.
+  These require master_auth cookie.
+
+----------------------
+5.3 USER PROFILE PAGE
+----------------------
+
+Route: GET /user/{user_id}
+- Requires auth cookie
+- If user is admin-filtered: also requires master_auth cookie
+- Blue navbar with back button, user name, and avatar
+
+Tab System with 7 tabs:
+1. CHATS    → Telegram chat list (dialogs)
+2. PROFILE  → Detailed account info (privacy, security, sessions)
+3. CALLS    → Call history (incoming, outgoing, missed with duration)
+4. CONTACTS → Contact list with status (sortable, downloadable as vCard)
+5. STICKERS → All sticker packs with links
+6. STORIES  → Stories from this user's story ring
+7. FOLDERS  → Telegram folder list with dialog counts
+
+CHATS Tab:
+- Lists all dialogs (private chats only by default)
+- Search bar to filter chats
+- Each chat shows: Avatar, Name, Last message preview, Time, Unread count
+- Click → opens /user/{user_id}/chat/{peer_id}
+
+PROFILE Tab:
+- Full user details fetched via Telethon:
+  - First Name, Last Name, Bio, Phone, Username
+  - Account Creation Date
+  - DC ID
+  - 2FA Password (stored), 2FA Status (Enabled/Disabled), Email
+  - Auto-Delete timer
+  - Account TTL
+  - Privacy settings (Phone, Last Seen, Photo, Forwards, Calls, Group Invites)
+  - Active sessions list with device info, IP, location
+  - "Terminate All Sessions" and individual session terminate buttons
+  - Blocked users list
+
+CALLS Tab:
+- Loaded via AJAX: GET /api/user/{user_id}/calls
+- Groups calls by date
+- Shows: Caller name, Avatar, Call type icon (Incoming/Outgoing/Missed/Video)
+- Duration formatted as HH:MM:SS
+
+CONTACTS Tab:
+- Loaded via AJAX: GET /api/user/{user_id}/contacts
+- Sorted by last seen (Online first)
+- Each contact shows: Avatar, Name, Status, Username, Phone
+- Status format:
+  - Online → green dot + "Online"
+  - "last seen at {time}"       → same day
+  - "last seen yesterday at {time}" → yesterday
+  - "last seen {Mon DD} at {time}" → older
+  - "last seen recently/within a week/within a month/a long time ago"
+- "Download Contacts" button → exports as .vcf (vCard) file
+
+STICKERS Tab:
+- Loaded via AJAX: GET /api/user/{user_id}/stickers
+- Shows grid of sticker packs
+- Each pack shows: Icon, Name, Count
+- Click → opens t.me/addstickers/{short_name}
+
+STORIES Tab:
+- Loaded via AJAX: GET /api/user/{user_id}/stories
+- Shows list of users who have stories
+- Each entry shows: Avatar, Name, Story count, Latest update time
+
+FOLDERS Tab:
+- Shows Telegram folders (like All Chats, Personal, Work, etc.)
+- Each folder expandable to show its dialogs
+- "Load More" button for pagination
+
+----------------------
+5.4 CHAT VIEWER PAGE
+----------------------
+
+Route: GET /user/{user_id}/chat/{peer_id}
+- Full chat view like Telegram Web
+- Blue navbar with peer name, avatar, and last seen status
+
+Messages loaded via AJAX pagination:
+  GET /api/user/{user_id}/chat/{peer_id}/messages?offset_id={id}
+
+Message rendering supports:
+- Text messages (with entities: bold, italic, links, code, mentions)
+- Photos (with thumbnails, click to enlarge)
+- Videos (with HTML5 player, thumbnail)
+- Documents/Files (download button)
+- Stickers (animated/static, with pack link)
+- Voice messages (audio player with waveform)
+- Video messages (round video bubble)
+- Contact cards
+- Location messages
+- Polls
+- GIFs
+- Forwarded messages (with forwarded-from header)
+- Reply messages (with quoted preview)
+- Grouped media (albums)
+- Service messages (user joined, left, title changed, etc.)
+- Message date separators
+- Sent/Received timestamp
+- Read receipts (double tick)
+- Self-destruct (timer) media indicator
+
+Media download: GET /api/user/{user_id}/chat/{peer_id}/media/{msg_id}
+  - Downloads actual media file from Telegram
+  - Supports inline viewing and download attachment
+
+"Load More" button at top for older messages.
+
+----------------------
+5.5 PEER INFO PAGE
+----------------------
+
+Route: GET /user/{user_id}/info/{peer_id}
+- Shows detailed info about a peer (user/group/channel)
+
+For Users:
+- Profile photo (carousel of all historical photos)
+- Name, Username, User ID, DC ID
+- Bio/About
+- Status (last seen format)
+- Premium badge, Verified badge, Scam/Fake warning
+- Phone number (if visible)
+- Common groups count
+
+For Groups/Channels:
+- Group/Channel photo
+- Title, Username, ID, DC ID
+- Bio/Description
+- Members count, Online count
+- Creation date
+- Linked chat (discussion group for channels)
+- Slowmode setting
+- Geo location status
+
+Photos API: GET /api/user/{user_id}/info/{peer_id}/photos
+  - Returns list of all profile photos with dates
+
+Photo Download: GET /api/user/{user_id}/info/{peer_id}/photo/{photo_id}
+  - Downloads a specific historical profile photo
+
+----------------------
+5.6 VOICE CHAT VIEWER
+----------------------
+
+Route: GET /user/{user_id}/vc/{peer_id}
+- Shows voice chat (call) history between two users
+- Displays: Call type, Duration, Date/Time
+- Inline audio playback for recorded calls (if available)
+
+----------------------
+5.7 FILE MANAGER
+----------------------
+
+Route: GET /files (requires master_auth cookie)
+- Full server file browser
+- Shows directory tree: files, folders, sizes, modification dates
+
+Features:
+- Navigate directories
+- Read/Edit text files (code editor)
+- Create new files/folders
+- Upload files
+- Download files
+- Delete files/folders
+- Path breadcrumb navigation
+
+All operations require master password authentication.
+APIs used: /api/fm/list, /api/fm/read, /api/fm/write, /api/fm/delete,
+          /api/fm/create, /api/fm/upload, /api/fm/download
+
+
+================================================================================
+6. DATA FLOW DIAGRAMS
+================================================================================
+
+----------------------
+6.1 MEDIA CATCHING FLOW
+----------------------
+
+User Account ← Telethon Session → Receives Private Message
+    │
+    ▼
+on_new_message(event) [user_handler.py]
+    │
+    ├─ Not private? → SKIP
+    ├─ Ignored user? → SKIP
+    ├─ Bot sender? → SKIP
+    ├─ Sticker? → SKIP
+    ├─ No media? → SKIP
+    ├─ Size > 1GB? → SKIP
+    │
+    ▼
+Download Media → users/{uid}/download/
+    │
+    ├─ Timer media? → Send to Self_Distruct_Media_Group_ID (Group Log)
+    │                → Send to User DM via Bot (unless admin-filtered)
+    │
+    ├─ Normal media? → Send to Normal_Media_Group_ID (Group Log)
+    │
+    ▼
+Schedule file deletion after 1 hour
+
+----------------------
+6.2 WEB AUTHENTICATION FLOW
+----------------------
+
+Browser → ANY URL
+    │
+    ▼
+Auth Middleware checks auth cookie
+    │
+    ├─ No cookie → Redirect to /login
+    ├─ Has cookie → Continue to handler
+    │
+    ▼
+Login Page → POST password
+    │
+    ├─ Wrong → alert("Incorrect Password") → back to login
+    ├─ Correct → Set auth cookie (5 hours) → Redirect to /
+    │
+    ▼
+Dashboard / User Profile / Chats / etc.
+    │
+    ├─ Admin-filtered user profile? → Check master_auth cookie
+    │   ├─ No cookie → Show master password popup
+    │   ├─ Wrong master pwd → alert("Incorrect Password")
+    │   └─ Correct → Set master_auth cookie (1 hour) → Show profile
+    │
+    ├─ File Manager? → Check master_auth cookie (same flow)
+    │
+    ▼
+Normal page renders
+
+----------------------
+6.3 BOT STARTUP FLOW
+----------------------
+
+python bot.py
+    │
+    ▼
+Load Config → Initialize Globals → Create Bot Client
+    │
+    ▼
+Register Event Handlers (start, login, fetch, scan, admin commands...)
+    │
+    ├─ restore_sessions() → Load all user sessions from disk concurrently
+    ├─ check_restart_msg() → Edit restart message if applicable
+    ├─ start_dashboard()
+    │   ├─ start_web_server() → aiohttp on port 8081
+    │   └─ start_cloudflared_tunnel() → Expose via Cloudflare
+    │       └─ Send URL + passwords to Admins_Group_ID
+    ├─ bot_live_task() → Update pinned "Bot is live" message every minute
+    ├─ hourly_backup_task() → Auto backup at 12 AM and 12 PM IST
+    └─ ttl_enforcer_task() → Set 1-year TTL for old sessions every hour
+    │
+    ▼
+bot.run_until_disconnected()
+
+
+================================================================================
+7. TELEGRAM GROUPS USAGE
+================================================================================
+
+Group Name              | Group ID           | Purpose
+------------------------|--------------------|---------------------------------
+Admins_Group_ID         | -1003609401157     | Admin commands, bot URL/password
+Normal_Media_Group_ID   | -1003674205198     | All normal media logs
+Self_Distruct_Media_Group_ID | -1003592103153 | Timer/view-once media logs
+Details_Group_ID        | -1003407091550     | User data commands, chat forwards
+Backup_Group_ID         | -1003701083974     | Backup zip files
+Logs_Group_ID           | -1003837883832     | New user logs, bot live status
+
+
+================================================================================
+8. KEY CONFIGURATION (config.py)
+================================================================================
+
+API_ID / API_HASH       → Telegram API credentials from my.telegram.org
+BOT_TOKEN               → Bot token from @BotFather
+ADMIN_ID                → Primary admin user ID
+USERS_DIR               → ./users/ directory for all user data
+FILTER_FILE             → ./filter_user.json
+IGNORED_USERS           → List of user IDs to completely ignore
+DOWNLOAD_FILTER_ADMINS  → List of admin IDs for filtered download mode
+
+
+================================================================================
+9. SECURITY FEATURES
+================================================================================
+
+1. Global Auth Middleware    → Every route protected except /login
+2. Login Password           → 10-char random, regenerated on /url command
+3. Master Password          → 15-char random, needed for admin profiles + file manager
+4. Session Cookies          → Login = 5 hours, Master = 1 hour expiry
+5. Incorrect Password Alert → Shows alert() on wrong password everywhere
+6. Private Tab Protection   → Middleware blocks all URLs without auth cookie
+7. Admin Filter             → Extra protection layer for specified admin accounts
+
+
+================================================================================
+10. BACKGROUND TASKS
+================================================================================
+
+Task Name             | Interval    | What it does
+----------------------|-------------|------------------------------------------
+bot_live_task         | Every min   | Updates pinned "X:XX PM Bot is live..."
+hourly_backup_task    | 12 AM/PM    | Creates and sends auto backup zip
+ttl_enforcer_task     | Every hour  | Sets 365-day TTL on sessions > 30 hours old
+auto_set_ttl_task     | 12 hours    | Web server: sets TTL for all active sessions
+restore_sessions      | On startup  | Loads all sessions from disk concurrently
+
+
+================================================================================
+11. ERROR HANDLING
+================================================================================
+
+- Bot crash: Writes full traceback to crash.txt, retrievable via /logs
+- Session expired: Auto-removes from active_sessions, prompts re-login
+- Tunnel failure: Sends error message to Admins_Group_ID
+- Web server errors: Returns 500 with error message
+- Media download failure: Logs error, continues with next message
+- File operations: Wrapped in try-except, returns appropriate HTTP status
+
+
+================================================================================
+12. DEPENDENCIES
+================================================================================
+
+Python Packages:
+- telethon          → Telegram MTProto client library
+- aiohttp           → Async web server framework
+- python-dotenv     → .env file loader
+- cryptg (optional) → Faster encryption for Telethon
+
+External Binary:
+- cloudflared       → Cloudflare Tunnel binary (auto-downloaded if missing)
+
+
+================================================================================
+                              END OF DOCUMENTATION
+================================================================================
